@@ -14,8 +14,22 @@ namespace YART.Data
     {
         private const int AutoStartCheckInterval = 250;
 
-        private readonly Dictionary<ResearchChannel, List<ResearchProjectDef>> queues
-            = new Dictionary<ResearchChannel, List<ResearchProjectDef>>();
+        private readonly Dictionary<int, Dictionary<ResearchChannel, List<ResearchProjectDef>>> factionQueues
+            = new Dictionary<int, Dictionary<ResearchChannel, List<ResearchProjectDef>>>();
+
+        private Dictionary<ResearchChannel, List<ResearchProjectDef>> CurrentQueues
+        {
+            get
+            {
+                int factionId = Faction.OfPlayerSilentFail?.loadID ?? -1;
+                if (!factionQueues.TryGetValue(factionId, out var qs))
+                {
+                    qs = new Dictionary<ResearchChannel, List<ResearchProjectDef>>();
+                    factionQueues[factionId] = qs;
+                }
+                return qs;
+            }
+        }
 
         // BeginProject가 유발하는 SetCurrentProject/StopProject 포스트픽스의 재진입 방지
         private bool suppressSync;
@@ -31,10 +45,11 @@ namespace YART.Data
 
         private List<ResearchProjectDef> GetOrAddQueue(ResearchChannel channel)
         {
-            if (!queues.TryGetValue(channel, out var q))
+            var qs = CurrentQueues;
+            if (!qs.TryGetValue(channel, out var q))
             {
                 q = new List<ResearchProjectDef>();
-                queues[channel] = q;
+                qs[channel] = q;
             }
             return q;
         }
@@ -42,27 +57,80 @@ namespace YART.Data
         public override void ExposeData()
         {
             base.ExposeData();
-            foreach (var channel in ChannelRegistry.All)
+            
+            List<int> activeFactions = null;
+            if (Scribe.mode == LoadSaveMode.Saving)
             {
-                var list = GetOrAddQueue(channel);
-                Scribe_Collections.Look(ref list, "queue_" + channel.Id, LookMode.Def);
-                queues[channel] = list ?? new List<ResearchProjectDef>();
+                activeFactions = factionQueues.Keys.ToList();
+            }
+            Scribe_Collections.Look(ref activeFactions, "activeFactions", LookMode.Value);
+            
+            if (activeFactions == null) activeFactions = new List<int>();
+
+            if (activeFactions.Count > 0 || Scribe.mode == LoadSaveMode.Saving)
+            {
+                foreach (int factionId in activeFactions)
+                {
+                    if (!factionQueues.TryGetValue(factionId, out var qs))
+                    {
+                        qs = new Dictionary<ResearchChannel, List<ResearchProjectDef>>();
+                        factionQueues[factionId] = qs;
+                    }
+
+                    foreach (var channel in ChannelRegistry.All)
+                    {
+                        qs.TryGetValue(channel, out var list);
+                        if (list == null) list = new List<ResearchProjectDef>();
+                        Scribe_Collections.Look(ref list, $"queue_{factionId}_{channel.Id}", LookMode.Def);
+                        qs[channel] = list ?? new List<ResearchProjectDef>();
+                    }
+                }
+            }
+            else
+            {
+                var qs = new Dictionary<ResearchChannel, List<ResearchProjectDef>>();
+                foreach (var channel in ChannelRegistry.All)
+                {
+                    List<ResearchProjectDef> oldList = null;
+                    Scribe_Collections.Look(ref oldList, "queue_" + channel.Id, LookMode.Def);
+                    qs[channel] = oldList ?? new List<ResearchProjectDef>();
+                }
+                
+                if (Scribe.mode == LoadSaveMode.LoadingVars)
+                {
+                    factionQueues[-1] = qs;
+                }
             }
         }
 
         public override void LoadedGame()
         {
             base.LoadedGame();
-            foreach (var channel in queues.Keys.ToList())
+
+            if (factionQueues.TryGetValue(-1, out var legacyQs))
             {
-                queues[channel].RemoveAll(d => d == null || d.IsFinished);
-                EnsureTopologicalOrder(channel);
+                int pid = Faction.OfPlayerSilentFail?.loadID ?? -1;
+                if (pid != -1)
+                {
+                    factionQueues.Remove(-1);
+                    factionQueues[pid] = legacyQs;
+                }
+            }
+
+            foreach (var qs in factionQueues.Values)
+            {
+                foreach (var channel in qs.Keys.ToList())
+                {
+                    qs[channel].RemoveAll(d => d == null || d.IsFinished);
+                    EnsureTopologicalOrderInternal(channel, qs);
+                }
             }
         }
 
         public override void GameComponentTick()
         {
             base.GameComponentTick();
+            if (MultiplayerCompat.InMultiplayer) return;
             if (Find.TickManager.TicksGame % AutoStartCheckInterval == 0)
             {
                 TryStartAllHeads(playSound: false);
@@ -181,7 +249,7 @@ namespace YART.Data
                 }
             }
 
-            foreach (var channel in queues.Keys.ToList())
+            foreach (var channel in CurrentQueues.Keys.ToList())
             {
                 EnsureTopologicalOrder(channel);
             }
@@ -280,16 +348,17 @@ namespace YART.Data
 
             bool wasCurrent = Find.ResearchManager.IsCurrentProject(def);
 
-            foreach (var q in queues.Values) q.Remove(def);
+            var qs = CurrentQueues;
+            foreach (var q in qs.Values) q.Remove(def);
 
             // 의존 항목 연쇄 제거
-            var dependents = queues.Values
+            var dependents = qs.Values
                 .SelectMany(q => q)
                 .Where(d => CollectMissingChain(d).Contains(def))
                 .ToList();
             foreach (var dep in dependents)
             {
-                foreach (var q in queues.Values) q.Remove(dep);
+                foreach (var q in qs.Values) q.Remove(dep);
             }
 
             if (wasCurrent)
@@ -343,7 +412,8 @@ namespace YART.Data
         {
             if (Current.ProgramState != ProgramState.Playing) return;
 
-            foreach (var kvp in queues)
+            var qs = CurrentQueues;
+            foreach (var kvp in qs)
             {
                 var q = kvp.Value;
                 q.RemoveAll(d => d == null || d.IsFinished);
@@ -459,7 +529,8 @@ namespace YART.Data
 
         public void Notify_ProjectFinished(ResearchProjectDef proj)
         {
-            foreach (var q in queues.Values) q.Remove(proj);
+            var qs = CurrentQueues;
+            foreach (var q in qs.Values) q.Remove(proj);
             ResearchNode.InvalidateAllStates();
             TryStartAllHeads(playSound: false);
         }
@@ -490,8 +561,12 @@ namespace YART.Data
         /// </summary>
         private void EnsureTopologicalOrder(ResearchChannel channel)
         {
-            var q = GetOrAddQueue(channel);
-            if (q.Count < 2) return;
+            EnsureTopologicalOrderInternal(channel, CurrentQueues);
+        }
+
+        private void EnsureTopologicalOrderInternal(ResearchChannel channel, Dictionary<ResearchChannel, List<ResearchProjectDef>> qs)
+        {
+            if (!qs.TryGetValue(channel, out var q) || q.Count < 2) return;
 
             var ordered = new List<ResearchProjectDef>(q.Count);
             var visited = new HashSet<ResearchProjectDef>();

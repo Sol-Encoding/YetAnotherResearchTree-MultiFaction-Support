@@ -133,6 +133,7 @@ namespace YART
             letter.Text = body.ToString();
             letter.project = proj;
             letter.nextProject = next;
+            letter.relatedFaction = Faction.OfPlayer;
             Find.LetterStack.ReceiveLetter(letter);
         }
     }
